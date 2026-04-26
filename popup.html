@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Flow Auto Prompt</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 100%;
+      max-width: 420px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f0f0f; color: #e8e8e8; padding: 16px;
+    }
+    h2 { font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 12px; }
+
+    textarea {
+      width: 100%; height: 160px;
+      background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      color: #e8e8e8; font-size: 12px; line-height: 1.6; padding: 10px;
+      resize: vertical; outline: none; font-family: 'Courier New', monospace;
+    }
+    textarea:focus { border-color: #555; }
+    textarea::placeholder { color: #555; }
+    .meta { font-size: 11px; color: #555; margin: 6px 0 10px; text-align: right; }
+
+    /* ── Ref image section ── */
+    .ref-section {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      padding: 10px 12px; margin-bottom: 12px;
+    }
+    .ref-label { font-size: 11px; color: #888; margin-bottom: 8px; }
+
+    .ref-modes { display: flex; gap: 6px; margin-bottom: 10px; }
+    .ref-mode-btn {
+      flex: 1; padding: 5px 0; font-size: 11px; font-weight: 600;
+      background: #252525; border: 1px solid #333; border-radius: 6px;
+      color: #888; cursor: pointer;
+    }
+    .ref-mode-btn.active { background: #1e3a5f; border-color: #2563eb; color: #60a5fa; }
+
+    .ref-upload, .ref-gallery { display: none; }
+    .ref-upload.visible, .ref-gallery.visible { display: block; }
+
+    /* upload mode */
+    .ref-file-row { display: flex; align-items: center; gap: 6px; }
+    #btn-pick-img {
+      padding: 4px 10px; font-size: 11px; font-weight: 600;
+      background: #2a2a2a; border: 1px solid #444; border-radius: 6px;
+      color: #ccc; cursor: pointer; white-space: nowrap;
+    }
+    #btn-pick-img:hover { background: #333; }
+    #img-name { flex: 1; font-size: 11px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #img-name.loaded { color: #4ade80; }
+    #file-input-hidden { display: none; }
+
+    /* gallery mode */
+    .ref-gallery-row { display: flex; align-items: center; gap: 6px; }
+    #btn-pick-flow {
+      padding: 5px 12px; font-size: 11px; font-weight: 600;
+      background: #1e3a5f; border: 1px solid #2563eb; border-radius: 6px;
+      color: #60a5fa; cursor: pointer; white-space: nowrap;
+    }
+    #btn-pick-flow:hover { background: #1a3055; }
+    #btn-pick-flow.picking { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+    #gallery-status { flex: 1; font-size: 11px; color: #555; overflow: hidden; }
+    #gallery-status.selected { color: #4ade80; }
+    #gallery-thumb {
+      width: 36px; height: 36px; border-radius: 4px; object-fit: cover;
+      display: none; border: 1px solid #333;
+    }
+    #gallery-thumb.visible { display: block; }
+
+    /* clear btn */
+    .btn-clear {
+      padding: 3px 7px; font-size: 11px; background: transparent;
+      border: none; color: #555; cursor: pointer; flex: none;
+    }
+    .btn-clear:hover { color: #f87171; }
+
+    /* ── Delay row ── */
+    .delay-row {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+    }
+    .delay-row label { font-size: 12px; color: #888; flex: 1; }
+    .delay-row input[type="number"] {
+      width: 64px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px;
+      color: #e8e8e8; font-size: 12px; padding: 4px 8px; outline: none; text-align: center;
+    }
+
+    /* ── Buttons ── */
+    .btn-row { display: flex; gap: 8px; margin-bottom: 14px; }
+    button.main { flex: 1; padding: 9px 0; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+    button.main:disabled { opacity: 0.35; cursor: not-allowed; }
+    #btn-start { background: #2563eb; color: #fff; }
+    #btn-start:hover:not(:disabled) { background: #1d4ed8; }
+    #btn-stop { background: #1a1a1a; color: #e8e8e8; border: 1px solid #333; }
+    #btn-stop:hover:not(:disabled) { background: #2a2a2a; }
+
+    /* ── Progress ── */
+    .progress-wrap { background: #1a1a1a; border-radius: 8px; padding: 10px 12px; border: 1px solid #222; }
+    .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-bottom: 7px; }
+    .progress-label span:last-child { color: #aaa; font-weight: 600; }
+    .progress-bar-bg { height: 4px; background: #2a2a2a; border-radius: 4px; overflow: hidden; margin-bottom: 10px; }
+    .progress-bar-fill { height: 100%; background: #2563eb; border-radius: 4px; transition: width 0.4s; width: 0%; }
+    .log { font-size: 11px; color: #666; height: 56px; overflow-y: auto; line-height: 1.6; }
+    .log .entry { padding: 1px 0; }
+    .log .entry.ok  { color: #4ade80; }
+    .log .entry.err { color: #f87171; }
+    .log .entry.info{ color: #60a5fa; }
+    .log .entry.warn{ color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+    <h2 style="margin:0">Flow Auto Prompt</h2>
+    <button id="btn-close" style="background:transparent;border:none;color:#555;font-size:16px;cursor:pointer;padding:2px 6px;border-radius:4px;" title="Close">✕</button>
+  </div>
+
+  <!-- Mode tabs -->
+  <div style="display:flex;gap:4px;margin-bottom:12px;">
+    <button id="tab-image" class="ref-mode-btn active" style="flex:1;padding:8px 0;font-size:12px;">🖼 Image</button>
+    <button id="tab-video" class="ref-mode-btn" style="flex:1;padding:8px 0;font-size:12px;">🎬 Video</button>
+  </div>
+
+  <textarea id="prompts" placeholder="Paste prompts here — one per line."></textarea>
+  <div class="meta" id="prompt-count">0 prompts</div>
+
+  <!-- Image mode: Reference image -->
+  <div class="ref-section" id="ref-image-section">
+    <div class="ref-label">Reference image (optional)</div>
+    <div class="ref-modes">
+      <button class="ref-mode-btn active" id="mode-upload">Upload file</button>
+      <button class="ref-mode-btn" id="mode-gallery">From gallery</button>
+    </div>
+
+    <div class="ref-upload visible" id="panel-upload">
+      <div class="ref-file-row">
+        <button id="btn-pick-img">Choose</button>
+        <span id="img-name">No file selected</span>
+        <button class="btn-clear" id="btn-clear-img">✕</button>
+        <input type="file" id="file-input-hidden" accept="image/png,image/jpeg,image/webp" />
+      </div>
+    </div>
+
+    <div class="ref-gallery" id="panel-gallery">
+      <div style="font-size:11px;color:#888;margin-bottom:8px;line-height:1.4;">
+        Load images from Flow's <b style="color:#ccc">+</b> dropdown. Click thumbnails to select; selected frames cycle across prompts.
+      </div>
+      <div style="display:flex;gap:6px;margin-bottom:8px;">
+        <button id="btn-load-image-storyboard" style="flex:1;padding:6px 10px;font-size:11px;font-weight:600;background:#1e3a5f;border:1px solid #2563eb;border-radius:6px;color:#60a5fa;cursor:pointer;">⟳ Load from Flow</button>
+        <button id="btn-clear-image-storyboard" style="padding:6px 10px;font-size:11px;font-weight:600;background:#2a2a2a;border:1px solid #444;border-radius:6px;color:#ccc;cursor:pointer;">Clear</button>
+      </div>
+      <div id="image-storyboard-status" style="font-size:11px;color:#888;margin-bottom:6px;">No frames loaded.</div>
+      <div id="image-storyboard-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-height:280px;overflow-y:auto;padding:4px;background:#0a0a0a;border:1px solid #222;border-radius:6px;"></div>
+      <div id="image-storyboard-mapping" style="margin-top:10px;font-size:11px;line-height:1.5;"></div>
+    </div>
+  </div>
+
+  <!-- Video mode: storyboard picker -->
+  <div class="ref-section" id="ref-video-section" style="display:none;">
+    <div class="ref-label">Storyboard frames</div>
+    <div style="font-size:11px;color:#888;margin-bottom:8px;line-height:1.4;">
+      Switch Flow to <b style="color:#ccc">Video</b> mode (must see <b style="color:#ccc">Bắt đầu</b> button), then click Load.
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:8px;">
+      <button id="btn-load-storyboard" style="flex:1;padding:6px 10px;font-size:11px;font-weight:600;background:#1e3a5f;border:1px solid #2563eb;border-radius:6px;color:#60a5fa;cursor:pointer;">⟳ Load from Flow</button>
+      <button id="btn-clear-storyboard" style="padding:6px 10px;font-size:11px;font-weight:600;background:#2a2a2a;border:1px solid #444;border-radius:6px;color:#ccc;cursor:pointer;">Clear</button>
+    </div>
+    <div id="storyboard-status" style="font-size:11px;color:#888;margin-bottom:6px;">No frames loaded.</div>
+    <div id="storyboard-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-height:280px;overflow-y:auto;padding:4px;background:#0a0a0a;border:1px solid #222;border-radius:6px;"></div>
+    <div id="storyboard-mapping" style="margin-top:10px;font-size:11px;line-height:1.5;"></div>
+    <style>
+      .frame-cell { position:relative; aspect-ratio:9/16; background:#1a1a1a; border:2px solid #333; border-radius:4px; overflow:hidden; cursor:pointer; transition:border-color 0.15s; }
+      .frame-cell:hover { border-color:#555; }
+      .frame-cell.selected { border-color:#2563eb; }
+      .frame-cell img { width:100%; height:100%; object-fit:cover; display:block; }
+      .frame-cell .order-badge { position:absolute; top:3px; left:3px; min-width:18px; height:18px; padding:0 5px; background:#2563eb; color:#fff; font-size:10px; font-weight:700; border-radius:9px; display:none; align-items:center; justify-content:center; box-shadow:0 0 0 2px #0a0a0a; }
+      .frame-cell.selected .order-badge { display:flex; }
+      .frame-cell .pos-num { position:absolute; bottom:2px; right:3px; font-size:9px; color:#888; background:rgba(0,0,0,0.6); padding:1px 4px; border-radius:3px; }
+    </style>
+  </div>
+
+  <div class="delay-row">
+    <label>Delay between prompts (seconds)</label>
+    <input type="number" id="delay" value="30" min="5" max="120" />
+  </div>
+
+  <div class="delay-row">
+    <label>Threads (Flow tabs to run in parallel)</label>
+    <input type="number" id="threads" value="1" min="1" max="10" />
+  </div>
+
+  <!-- Auto-download -->
+  <div class="ref-section">
+    <div class="ref-label" style="display:flex;align-items:center;gap:8px;">
+      <input type="checkbox" id="dl-enable" style="margin:0;cursor:pointer;" />
+      <label for="dl-enable" style="cursor:pointer;font-size:11px;color:#888;">Auto-download to folder</label>
+    </div>
+    <div id="dl-fields" style="display:none;margin-top:8px;">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+        <label style="font-size:11px;color:#888;flex:0 0 80px;">Subfolder</label>
+        <input type="text" id="dl-folder" value="flow-auto" placeholder="under Downloads/"
+          style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:6px;color:#e8e8e8;font-size:12px;padding:4px 8px;outline:none;" />
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <label style="font-size:11px;color:#888;flex:0 0 80px;">Prefix</label>
+        <input type="text" id="dl-prefix" value="scene" placeholder="filename prefix"
+          style="flex:1;background:#1a1a1a;border:1px solid #333;border-radius:6px;color:#e8e8e8;font-size:12px;padding:4px 8px;outline:none;" />
+      </div>
+      <div style="font-size:10px;color:#555;margin-top:6px;line-height:1.4;">
+        Saves as <code style="color:#888;">Downloads/&lt;subfolder&gt;/&lt;prefix&gt;_001.png</code>. Each worker waits for image completion (≤90s) before downloading.
+      </div>
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button class="main" id="btn-start">▶ Start</button>
+    <button class="main" id="btn-stop" disabled>■ Stop</button>
+  </div>
+
+  <div class="progress-wrap">
+    <div class="progress-label">
+      <span id="status-text">Idle</span>
+      <span id="count-text">0 / 0</span>
+    </div>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="progress-bar"></div>
+    </div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
