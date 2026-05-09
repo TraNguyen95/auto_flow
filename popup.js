@@ -14,15 +14,25 @@ const SEL = {
 };
 
 // ─── Page-side helpers for download tracking (world: MAIN) ───────────────────
-function snapshotMediaInPage() {
-  const imgs = document.querySelectorAll('img[src*="media.getMediaUrlRedirect"]');
+function snapshotMediaInPage(mediaType) {
   const items = [];
   const seen = new Set();
-  imgs.forEach(img => {
-    if (img.naturalWidth && img.naturalWidth < 200) return; // skip thumbnails
-    const m = img.src.match(/name=([a-f0-9-]+)/);
-    if (m && !seen.has(m[1])) { seen.add(m[1]); items.push({ uuid: m[1], url: img.src }); }
-  });
+  if (mediaType === 'video') {
+    // Video mode: detect <video src="...media.getMediaUrlRedirect...">
+    const videos = document.querySelectorAll('video[src*="media.getMediaUrlRedirect"]');
+    videos.forEach(v => {
+      const m = v.src.match(/name=([a-f0-9-]+)/);
+      if (m && !seen.has(m[1])) { seen.add(m[1]); items.push({ uuid: m[1], url: v.src }); }
+    });
+  } else {
+    // Image mode: detect <img src="...media.getMediaUrlRedirect...">
+    const imgs = document.querySelectorAll('img[src*="media.getMediaUrlRedirect"]');
+    imgs.forEach(img => {
+      if (img.naturalWidth && img.naturalWidth < 200) return; // skip thumbnails
+      const m = img.src.match(/name=([a-f0-9-]+)/);
+      if (m && !seen.has(m[1])) { seen.add(m[1]); items.push({ uuid: m[1], url: img.src }); }
+    });
+  }
   return items;
 }
 
@@ -847,11 +857,11 @@ $('btn-start').addEventListener('click', async () => {
   let dlConfig = null;
   if ($('dl-enable').checked) {
     const folder = ($('dl-folder').value || 'flow-auto').trim().replace(/^[/\\]+|[/\\]+$/g, '');
-    const prefix = ($('dl-prefix').value || 'scene').trim().replace(/[^\w\-]/g, '_');
+    const from = Math.max(0, parseInt($('dl-from').value) || 1);
     if (!folder) { log('Download folder required.', 'err'); return; }
     const ext = modeTab === 'video' ? 'mp4' : 'png';
-    dlConfig = { folder, prefix, ext, timeoutMs: 180000 }; // longer for video
-    log(`Auto-download: Downloads/${folder}/${prefix}_NNN.${ext}`, 'info');
+    dlConfig = { folder, from, ext };
+    log(`Auto-download: Downloads/${folder}/${from}..${from + prompts.length - 1}.${ext}`, 'info');
   }
 
   running = true;
@@ -869,7 +879,7 @@ $('btn-start').addEventListener('click', async () => {
   }
 
   // Init known UUIDs (so we don't claim pre-existing images as new)
-  const initial = (await execInTab(snapshotMediaInPage)) || [];
+  const initial = (await execInTab(snapshotMediaInPage, [modeTab])) || [];
   const knownUuids = new Set(initial.map(x => x.uuid));
   log(`Initial gallery: ${knownUuids.size} existing image(s).`, 'info');
 
@@ -883,7 +893,7 @@ $('btn-start').addEventListener('click', async () => {
   const watcher = (async () => {
     while (running && (pending.length > 0 || !submitDone)) {
       try {
-        const items = (await execInTab(snapshotMediaInPage)) || [];
+        const items = (await execInTab(snapshotMediaInPage, [modeTab])) || [];
         for (const it of items) {
           if (knownUuids.has(it.uuid)) continue;
           knownUuids.add(it.uuid);
@@ -945,7 +955,8 @@ $('btn-start').addEventListener('click', async () => {
       const elapsed = ((Date.now() - tsub) / 1000).toFixed(1);
       log(`#${idx + 1} image ready (gen ${elapsed}s) -> uuid ${img.uuid.slice(0, 8)}...`, 'ok');
       if (dlConfig) {
-        const filename = `${dlConfig.folder}/${dlConfig.prefix}_${String(idx + 1).padStart(3, '0')}.${dlConfig.ext}`;
+        const fileNum = dlConfig.from + idx;
+        const filename = `${dlConfig.folder}/${fileNum}.${dlConfig.ext}`;
         try {
           await chrome.downloads.download({
             url: img.url, filename, saveAs: false, conflictAction: 'uniquify',
