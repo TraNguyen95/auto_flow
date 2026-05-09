@@ -797,8 +797,10 @@ $('btn-start').addEventListener('click', async () => {
   const prompts = parsePrompts();
   if (!prompts.length) { log('No prompts.', 'err'); return; }
 
-  const delay   = Math.max(5, parseInt($('delay').value)   || 30);
-  const threads = Math.max(1, parseInt($('threads').value) ||  1);
+  const delay      = Math.max(5, parseInt($('delay').value)       || 30);
+  const threads    = Math.max(1, parseInt($('threads').value)     ||  1);
+  const maxRetries = Math.max(0, parseInt($('max-retries').value) ||  3);
+  const genTimeoutMs = modeTab === 'video' ? 300000 : 180000; // 5min video, 3min image
 
   // Single tab — pipeline mode (multiple in-flight generations on one Flow tab)
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -868,7 +870,7 @@ $('btn-start').addEventListener('click', async () => {
   $('btn-start').disabled = true; $('btn-stop').disabled = false; $('prompts').disabled = true;
   $('log').innerHTML = ''; setProgress(0, prompts.length);
   $('status-text').textContent = 'Running...';
-  log(`${prompts.length} prompts — pipeline cap=${threads} — ${delay}s submit gap`, 'info');
+  log(`${prompts.length} prompts — pipeline cap=${threads} — ${delay}s gap — retry=${maxRetries} — timeout=${genTimeoutMs/1000}s`, 'info');
 
   // Helper to call page functions on the tab
   async function execInTab(func, args = []) {
@@ -884,15 +886,87 @@ $('btn-start').addEventListener('click', async () => {
   log(`Initial gallery: ${knownUuids.size} existing image(s).`, 'info');
 
   // FIFO queue of pending submissions awaiting completion
-  // Each entry: { idx, resolve, ts }
+  // Each entry: { idx, resolve, ts, retries, prompt, frameConfig }
   const pending = [];
   let submitDone = false;
   let doneCount = 0;
 
-  // Background watcher: poll DOM, match new UUIDs to oldest pending submission
+  // Helper: build frame config for a prompt index (reused by submit + retry)
+  function buildFrameConfig(promptIdx) {
+    if (modeTab === 'video') {
+      const f = videoConfig.frames[promptIdx];
+      return { startRef: f.startRef, endRef: f.endRef };
+    }
+    if (imageGallerySel && imageGallerySel.length > 0) {
+      const selIdx = imageGallerySel[promptIdx % imageGallerySel.length];
+      const item = SB.image.items.find(x => x.dropdownIdx === selIdx);
+      return { mode: 'gallery', uuid: item?.uuid, index: selIdx };
+    }
+    return imgConfig; // upload or null
+  }
+
+  // Helper: submit a prompt to the page (reused by main loop + retry)
+  async function submitOne(prompt, frameConfig) {
+    if (modeTab === 'video') {
+      return await execInTab(submitVideoPromptInPage, [prompt, SEL, frameConfig.startRef, frameConfig.endRef]);
+    }
+    return await execInTab(submitPromptInPage, [prompt, SEL, frameConfig]);
+  }
+
+  // Helper: register pending entry + handle completion (success or timeout→retry)
+  function registerPending(promptIdx, prompt, frameConfig, retries) {
+    const tsub = Date.now();
+    const completion = new Promise(resolve => {
+      pending.push({ idx: promptIdx, resolve, ts: tsub, retries, prompt, frameConfig });
+    });
+    completion.then(async (media) => {
+      if (!media) {
+        // Timeout — retry or skip
+        if (retries < maxRetries && running) {
+          log(`#${promptIdx + 1} timed out after ${genTimeoutMs / 1000}s, retrying (${retries + 1}/${maxRetries})...`, 'warn');
+          try {
+            const r = await submitOne(prompt, frameConfig);
+            if (r?.success) {
+              log(`#${promptIdx + 1} re-submitted (retry ${retries + 1}/${maxRetries})`, 'info');
+              registerPending(promptIdx, prompt, frameConfig, retries + 1);
+              return;
+            }
+            log(`#${promptIdx + 1} retry submit failed: ${r?.error || '?'}`, 'err');
+          } catch (err) {
+            log(`#${promptIdx + 1} retry submit error: ${err.message}`, 'err');
+          }
+        } else if (retries >= maxRetries) {
+          log(`#${promptIdx + 1} failed after ${maxRetries} retries, skipping`, 'err');
+        }
+        doneCount++;
+        setProgress(doneCount, prompts.length);
+        $('status-text').textContent = `${doneCount} / ${prompts.length}`;
+        return;
+      }
+      // Success — download
+      const elapsed = ((Date.now() - tsub) / 1000).toFixed(1);
+      log(`#${promptIdx + 1} ready (gen ${elapsed}s) -> uuid ${media.uuid.slice(0, 8)}...`, 'ok');
+      if (dlConfig) {
+        const fileNum = dlConfig.from + promptIdx;
+        const filename = `${dlConfig.folder}/${fileNum}.${dlConfig.ext}`;
+        try {
+          await chrome.downloads.download({
+            url: media.url, filename, saveAs: false, conflictAction: 'uniquify',
+          });
+          log(`#${promptIdx + 1} downloaded -> ${filename}`, 'ok');
+        } catch (err) { log(`#${promptIdx + 1} download FAILED: ${err.message}`, 'err'); }
+      }
+      doneCount++;
+      setProgress(doneCount, prompts.length);
+      $('status-text').textContent = `${doneCount} / ${prompts.length}`;
+    });
+  }
+
+  // Background watcher: poll DOM for new media + detect timeouts
   const watcher = (async () => {
     while (running && (pending.length > 0 || !submitDone)) {
       try {
+        // Check for new media UUIDs
         const items = (await execInTab(snapshotMediaInPage, [modeTab])) || [];
         for (const it of items) {
           if (knownUuids.has(it.uuid)) continue;
@@ -900,6 +974,13 @@ $('btn-start').addEventListener('click', async () => {
           if (pending.length > 0) {
             const w = pending.shift();
             w.resolve(it);
+          }
+        }
+        // Check timeouts — resolve(null) for entries that exceeded genTimeoutMs
+        for (let j = pending.length - 1; j >= 0; j--) {
+          if (Date.now() - pending[j].ts > genTimeoutMs) {
+            const timedOut = pending.splice(j, 1)[0];
+            timedOut.resolve(null);
           }
         }
       } catch (_) {}
@@ -919,28 +1000,11 @@ $('btn-start').addEventListener('click', async () => {
     if (!running) break;
 
     log(`#${i + 1} submitting (in-flight before: ${pending.length})...`);
-    const tsub = Date.now();
+    const frameConfig = buildFrameConfig(i);
     let submitOk = false;
     try {
-      let r;
-      if (modeTab === 'video') {
-        const f = videoConfig.frames[i];
-        r = await execInTab(submitVideoPromptInPage, [prompts[i], SEL, f.startRef, f.endRef]);
-      } else {
-        // Image: per-prompt cfg if gallery selection exists, else shared imgConfig (upload or null)
-        let cfg = imgConfig;
-        if (imageGallerySel && imageGallerySel.length > 0) {
-          const selIdx = imageGallerySel[i % imageGallerySel.length];
-          const item = SB.image.items.find(x => x.dropdownIdx === selIdx);
-          cfg = {
-            mode: 'gallery',
-            uuid: item?.uuid,         // primary key — UUID-resolved
-            index: selIdx,            // fallback if uuid missing
-          };
-        }
-        r = await execInTab(submitPromptInPage, [prompts[i], SEL, cfg]);
-      }
-      if (r?.success) { submitOk = true; log(`#${i + 1} submitted in ${((Date.now() - tsub) / 1000).toFixed(1)}s`, 'ok'); }
+      const r = await submitOne(prompts[i], frameConfig);
+      if (r?.success) { submitOk = true; log(`#${i + 1} submitted`, 'ok'); }
       else log(`#${i + 1} submit ERR: ${r?.error || '?'}`, 'err');
     } catch (err) {
       log(`#${i + 1} submit FAILED: ${err.message}`, 'err');
@@ -948,26 +1012,7 @@ $('btn-start').addEventListener('click', async () => {
 
     if (!submitOk) { doneCount++; setProgress(doneCount, prompts.length); continue; }
 
-    // Register in pending queue + spawn completion handler
-    const idx = i;
-    const completion = new Promise(resolve => pending.push({ idx, resolve, ts: Date.now() }));
-    completion.then(async (img) => {
-      const elapsed = ((Date.now() - tsub) / 1000).toFixed(1);
-      log(`#${idx + 1} image ready (gen ${elapsed}s) -> uuid ${img.uuid.slice(0, 8)}...`, 'ok');
-      if (dlConfig) {
-        const fileNum = dlConfig.from + idx;
-        const filename = `${dlConfig.folder}/${fileNum}.${dlConfig.ext}`;
-        try {
-          await chrome.downloads.download({
-            url: img.url, filename, saveAs: false, conflictAction: 'uniquify',
-          });
-          log(`#${idx + 1} downloaded -> ${filename}`, 'ok');
-        } catch (err) { log(`#${idx + 1} download FAILED: ${err.message}`, 'err'); }
-      }
-      doneCount++;
-      setProgress(doneCount, prompts.length);
-      $('status-text').textContent = `${doneCount} / ${prompts.length}`;
-    });
+    registerPending(i, prompts[i], frameConfig, 0);
 
     // Inter-submit delay (gives Slate time to reset; also paces submissions)
     if (i < prompts.length - 1) await sleep(delay * 1000);
