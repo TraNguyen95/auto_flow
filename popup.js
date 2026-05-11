@@ -751,14 +751,56 @@ function parsePrompts() {
   return $('prompts').value.split('\n').map(l => l.trim()).filter(Boolean);
 }
 function log(msg, type = '') {
-  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const ts = new Date().toISOString().slice(11, 23);
+  const logEl = $('log');
   const el = document.createElement('div');
   el.className = `entry ${type}`; el.textContent = `[${ts}] ${msg}`;
-  $('log').appendChild(el); $('log').scrollTop = $('log').scrollHeight;
+  logEl.appendChild(el);
+  // Keep max 200 entries to avoid DOM bloat on long runs
+  while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
 }
 function setProgress(cur, tot) {
   $('progress-bar').style.width = (tot > 0 ? Math.round(cur / tot * 100) : 0) + '%';
   $('count-text').textContent = `${cur} / ${tot}`;
+}
+function formatTime(secs) {
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function renderSummary(results, totalElapsed) {
+  const success = results.filter(r => r.status === 'success');
+  const failed = results.filter(r => r.status !== 'success');
+  let html = `<div class="summary">`;
+  html += `<div class="summary-stats">
+    <span class="stat-ok">${success.length} success</span>
+    <span class="stat-err">${failed.length} failed</span>
+    <span class="stat-time">${formatTime(totalElapsed)}</span>
+  </div>`;
+  if (failed.length > 0) {
+    html += `<div class="summary-failed">`;
+    failed.forEach(r => {
+      const promptShort = escHtml(r.prompt.slice(0, 40) + (r.prompt.length > 40 ? '...' : ''));
+      const retryInfo = r.retries > 0 ? ` (${r.retries} retries)` : '';
+      html += `<div class="fail-row">#${r.idx + 1} ${promptShort}${retryInfo}</div>`;
+    });
+    html += `</div>`;
+  }
+  html += `</div>`;
+  $('summary-panel').innerHTML = html;
+  $('summary-panel').style.display = 'block';
+}
+function showBanner(results, totalElapsed) {
+  const ok = results.filter(r => r.status === 'success').length;
+  const fail = results.length - ok;
+  const type = fail > 0 ? 'fail' : 'ok';
+  const icon = fail > 0 ? '✗' : '✓';
+  const banner = $('job-banner');
+  banner.className = `job-banner ${type}`;
+  banner.innerHTML = `<span>${icon} Done! ${ok} success · ${fail} failed · ${formatTime(totalElapsed)}</span>`
+    + `<button class="dismiss" onclick="this.parentElement.style.display='none'">✕</button>`;
+  banner.style.display = 'flex';
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -798,9 +840,16 @@ $('btn-start').addEventListener('click', async () => {
   if (!prompts.length) { log('No prompts.', 'err'); return; }
 
   const delay      = Math.max(5, parseInt($('delay').value)       || 30);
-  const threads    = Math.max(1, parseInt($('threads').value)     ||  1);
-  const maxRetries = Math.max(0, parseInt($('max-retries').value) ||  3);
+  let   threads    = Math.max(1, parseInt($('threads').value)     ||  1);
+  const rawRetries = parseInt($('max-retries').value);
+  const maxRetries = Math.max(0, Number.isFinite(rawRetries) ? rawRetries : 3);
   const genTimeoutMs = modeTab === 'video' ? 300000 : 180000; // 5min video, 3min image
+
+  // Force threads=1 when auto-download enabled to guarantee correct prompt↔video mapping
+  if ($('dl-enable').checked && threads > 1) {
+    log(`Threads capped to 1 (auto-download on) to ensure correct numbering.`, 'warn');
+    threads = 1;
+  }
 
   // Single tab — pipeline mode (multiple in-flight generations on one Flow tab)
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -859,7 +908,8 @@ $('btn-start').addEventListener('click', async () => {
   let dlConfig = null;
   if ($('dl-enable').checked) {
     const folder = ($('dl-folder').value || 'flow-auto').trim().replace(/^[/\\]+|[/\\]+$/g, '');
-    const from = Math.max(0, parseInt($('dl-from').value) || 1);
+    const rawFrom = parseInt($('dl-from').value);
+    const from = Math.max(0, Number.isFinite(rawFrom) ? rawFrom : 1);
     if (!folder) { log('Download folder required.', 'err'); return; }
     const ext = modeTab === 'video' ? 'mp4' : 'png';
     dlConfig = { folder, from, ext };
@@ -867,8 +917,12 @@ $('btn-start').addEventListener('click', async () => {
   }
 
   running = true;
+  const results = [];
+  const jobStartTime = Date.now();
   $('btn-start').disabled = true; $('btn-stop').disabled = false; $('prompts').disabled = true;
   $('log').innerHTML = ''; setProgress(0, prompts.length);
+  $('summary-panel').style.display = 'none'; $('summary-panel').innerHTML = '';
+  $('job-banner').style.display = 'none';
   $('status-text').textContent = 'Running...';
   log(`${prompts.length} prompts — pipeline cap=${threads} — ${delay}s gap — retry=${maxRetries} — timeout=${genTimeoutMs/1000}s`, 'info');
 
@@ -888,7 +942,6 @@ $('btn-start').addEventListener('click', async () => {
   // FIFO queue of pending submissions awaiting completion
   // Each entry: { idx, resolve, ts, retries, prompt, frameConfig }
   const pending = [];
-  let submitDone = false;
   let doneCount = 0;
 
   // Helper: build frame config for a prompt index (reused by submit + retry)
@@ -913,31 +966,19 @@ $('btn-start').addEventListener('click', async () => {
     return await execInTab(submitPromptInPage, [prompt, SEL, frameConfig]);
   }
 
-  // Helper: register pending entry + handle completion (success or timeout→retry)
-  function registerPending(promptIdx, prompt, frameConfig, retries) {
+  // Helper: register pending entry + handle final outcome (success or failure)
+  // Retry logic is handled by the watcher (entry stays in pending, no remove+re-add).
+  function registerPending(promptIdx, prompt, frameConfig) {
     const tsub = Date.now();
     const completion = new Promise(resolve => {
-      pending.push({ idx: promptIdx, resolve, ts: tsub, retries, prompt, frameConfig });
+      pending.push({ idx: promptIdx, resolve, ts: tsub, retries: 0, prompt, frameConfig });
     });
-    completion.then(async (media) => {
+    completion.then(async (outcome) => {
+      const media = outcome?.media;
+      const retries = outcome?.retries ?? 0;
       if (!media) {
-        // Timeout — retry or skip
-        if (retries < maxRetries && running) {
-          log(`#${promptIdx + 1} timed out after ${genTimeoutMs / 1000}s, retrying (${retries + 1}/${maxRetries})...`, 'warn');
-          try {
-            const r = await submitOne(prompt, frameConfig);
-            if (r?.success) {
-              log(`#${promptIdx + 1} re-submitted (retry ${retries + 1}/${maxRetries})`, 'info');
-              registerPending(promptIdx, prompt, frameConfig, retries + 1);
-              return;
-            }
-            log(`#${promptIdx + 1} retry submit failed: ${r?.error || '?'}`, 'err');
-          } catch (err) {
-            log(`#${promptIdx + 1} retry submit error: ${err.message}`, 'err');
-          }
-        } else if (retries >= maxRetries) {
-          log(`#${promptIdx + 1} failed after ${maxRetries} retries, skipping`, 'err');
-        }
+        // Final failure — retries exhausted or stopped
+        results.push({ idx: promptIdx, prompt, status: 'failed', retries, error: 'timeout' });
         doneCount++;
         setProgress(doneCount, prompts.length);
         $('status-text').textContent = `${doneCount} / ${prompts.length}`;
@@ -945,7 +986,8 @@ $('btn-start').addEventListener('click', async () => {
       }
       // Success — download
       const elapsed = ((Date.now() - tsub) / 1000).toFixed(1);
-      log(`#${promptIdx + 1} ready (gen ${elapsed}s) -> uuid ${media.uuid.slice(0, 8)}...`, 'ok');
+      results.push({ idx: promptIdx, prompt, status: 'success', retries, genTime: elapsed });
+      log(`#${promptIdx + 1} ready (gen ${elapsed}s, ${retries > 0 ? retries + ' retries' : 'first try'}) -> uuid ${media.uuid.slice(0, 8)}...`, 'ok');
       if (dlConfig) {
         const fileNum = dlConfig.from + promptIdx;
         const filename = `${dlConfig.folder}/${fileNum}.${dlConfig.ext}`;
@@ -962,9 +1004,9 @@ $('btn-start').addEventListener('click', async () => {
     });
   }
 
-  // Background watcher: poll DOM for new media + detect timeouts
+  // Background watcher: poll DOM for new media + handle timeouts/retries
   const watcher = (async () => {
-    while (running && (pending.length > 0 || !submitDone)) {
+    while (running && doneCount < prompts.length) {
       try {
         // Check for new media UUIDs
         const items = (await execInTab(snapshotMediaInPage, [modeTab])) || [];
@@ -973,19 +1015,39 @@ $('btn-start').addEventListener('click', async () => {
           knownUuids.add(it.uuid);
           if (pending.length > 0) {
             const w = pending.shift();
-            w.resolve(it);
+            w.resolve({ media: it, retries: w.retries });
           }
         }
-        // Check timeouts — resolve(null) for entries that exceeded genTimeoutMs
+        // Check timeouts — retry in-place or resolve as failure
         for (let j = pending.length - 1; j >= 0; j--) {
-          if (Date.now() - pending[j].ts > genTimeoutMs) {
-            const timedOut = pending.splice(j, 1)[0];
-            timedOut.resolve(null);
+          const p = pending[j];
+          if (Date.now() - p.ts <= genTimeoutMs) continue;
+          if (p.retries < maxRetries && running) {
+            // Retry: re-submit, entry stays in pending (no slot release)
+            log(`#${p.idx + 1} timed out after ${genTimeoutMs / 1000}s, retrying (${p.retries + 1}/${maxRetries})...`, 'warn');
+            try {
+              const r = await submitOne(p.prompt, p.frameConfig);
+              if (r?.success) {
+                p.retries++;
+                p.ts = Date.now(); // reset timeout clock
+                log(`#${p.idx + 1} re-submitted (retry ${p.retries}/${maxRetries})`, 'info');
+                continue; // keep in pending
+              }
+              log(`#${p.idx + 1} retry submit failed: ${r?.error || '?'}`, 'err');
+            } catch (err) {
+              log(`#${p.idx + 1} retry submit error: ${err.message}`, 'err');
+            }
+          } else if (p.retries >= maxRetries) {
+            log(`#${p.idx + 1} failed after ${maxRetries} retries, skipping`, 'err');
           }
+          // Final failure: remove and resolve
+          pending.splice(j, 1)[0].resolve({ media: null, retries: p.retries });
         }
       } catch (_) {}
       await sleep(1500);
     }
+    // Drain remaining pending on stop
+    for (const p of pending.splice(0)) p.resolve({ media: null, retries: p.retries });
   })();
 
   // Submit phase — serial submits, cap in-flight = threads
@@ -993,9 +1055,9 @@ $('btn-start').addEventListener('click', async () => {
     if (!running) break;
 
     // Wait for slot
-    while (pending.length >= threads && running) {
+    if (pending.length >= threads) {
       log(`#${i + 1} waiting for slot (in-flight: ${pending.length}/${threads})...`);
-      await sleep(1000);
+      while (pending.length >= threads && running) await sleep(2000);
     }
     if (!running) break;
 
@@ -1010,18 +1072,31 @@ $('btn-start').addEventListener('click', async () => {
       log(`#${i + 1} submit FAILED: ${err.message}`, 'err');
     }
 
-    if (!submitOk) { doneCount++; setProgress(doneCount, prompts.length); continue; }
+    if (!submitOk) {
+      results.push({ idx: i, prompt: prompts[i], status: 'skipped', retries: 0, error: 'submit failed' });
+      doneCount++; setProgress(doneCount, prompts.length); continue;
+    }
 
-    registerPending(i, prompts[i], frameConfig, 0);
+    registerPending(i, prompts[i], frameConfig);
 
     // Inter-submit delay (gives Slate time to reset; also paces submissions)
     if (i < prompts.length - 1) await sleep(delay * 1000);
   }
 
-  submitDone = true;
-  log(`All prompts submitted. Waiting for ${pending.length} remaining image(s)...`, 'info');
+  log(`All prompts submitted. Waiting for ${pending.length} remaining generation(s)...`, 'info');
   await watcher;
 
+  // Record any prompts that were never submitted (user clicked Stop mid-loop)
+  const recorded = new Set(results.map(r => r.idx));
+  for (let k = 0; k < prompts.length; k++) {
+    if (!recorded.has(k)) {
+      results.push({ idx: k, prompt: prompts[k], status: 'skipped', retries: 0, error: 'stopped' });
+    }
+  }
+
+  const totalElapsed = Math.round((Date.now() - jobStartTime) / 1000);
+  renderSummary(results, totalElapsed);
+  showBanner(results, totalElapsed);
   if (running) { $('status-text').textContent = 'All done!'; log(`Finished ${doneCount} prompts.`, 'ok'); }
   else         { log('Stopped.', 'warn'); }
   running = false;
