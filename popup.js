@@ -18,11 +18,17 @@ function snapshotMediaInPage(mediaType) {
   const items = [];
   const seen = new Set();
   if (mediaType === 'video') {
-    // Video mode: detect <video src="...media.getMediaUrlRedirect...">
+    // Video mode: <video> for Veo 2/3, <img> for Veo Lite (same URL, different element)
     const videos = document.querySelectorAll('video[src*="media.getMediaUrlRedirect"]');
     videos.forEach(v => {
       const m = v.src.match(/name=([a-f0-9-]+)/);
       if (m && !seen.has(m[1])) { seen.add(m[1]); items.push({ uuid: m[1], url: v.src }); }
+    });
+    const imgs = document.querySelectorAll('img[src*="media.getMediaUrlRedirect"]');
+    imgs.forEach(img => {
+      if (img.naturalWidth && img.naturalWidth < 200) return; // skip thumbnails
+      const m = img.src.match(/name=([a-f0-9-]+)/);
+      if (m && !seen.has(m[1])) { seen.add(m[1]); items.push({ uuid: m[1], url: img.src }); }
     });
   } else {
     // Image mode: detect <img src="...media.getMediaUrlRedirect...">
