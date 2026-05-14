@@ -289,22 +289,29 @@ async function submitVideoPromptInPage(prompt, sel, startRef, endRef) {
     return { ok: true };
   }
 
+  const logs = [];
+  const L = (...a) => logs.push(a.map(x => (typeof x === 'object' ? JSON.stringify(x) : x)).join(' '));
+
+  try {
+
   // Start frame (optional — null means text-to-video, no reference)
   if (startRef && (startRef.uuid || startRef.index)) {
     const sr = await attachFrame(sel.VIDEO_START_TEXTS, 0, startRef, 'Start frame');
-    if (!sr.ok) return { success: false, error: sr.error };
+    if (!sr.ok) return { success: false, error: sr.error, logs };
   }
 
   // End frame (optional)
   if (endRef && (endRef.uuid || endRef.index)) {
     const er = await attachFrame(sel.VIDEO_END_TEXTS, 1, endRef, 'End frame');
-    if (!er.ok) return { success: false, error: er.error };
+    if (!er.ok) return { success: false, error: er.error, logs };
   }
 
   // Inject prompt text
+
   const el = document.querySelector('[data-slate-editor="true"]')
     || document.querySelector('[contenteditable="true"][data-slate-node="value"]');
-  if (!el) return { success: false, error: 'Slate editor not found.' };
+  if (!el) return { success: false, error: 'Slate editor not found.', logs };
+  L('[DBG-1] editor found, curText:', JSON.stringify(el.textContent.slice(0,50)));
 
   el.click(); await sleep(200);
   const range = document.createRange();
@@ -313,25 +320,82 @@ async function submitVideoPromptInPage(prompt, sel, startRef, endRef) {
   domSel.removeAllRanges(); domSel.addRange(range);
   await sleep(100);
 
-  el.dispatchEvent(new InputEvent('beforeinput', {
+  // --- Method 1: beforeinput ---
+  const evt = new InputEvent('beforeinput', {
     inputType: 'insertText', data: prompt,
     bubbles: true, cancelable: true, composed: true,
-  }));
+  });
+  const notCanceled = el.dispatchEvent(evt);
+  L('[DBG-2] beforeinput notCanceled:', notCanceled);
   await sleep(400);
+  const textAfterBI = el.textContent.replace(/﻿/g, '').trim();
+  L('[DBG-3] after beforeinput len:', textAfterBI.length, '| text:', textAfterBI.slice(0,60));
 
-  if (!el.textContent.replace(/﻿/g, '').trim()) {
+  // --- Method 2: execCommand fallback ---
+  if (!textAfterBI) {
+    L('[DBG-4] beforeinput no effect → execCommand');
     el.focus(); document.execCommand('selectAll');
     await sleep(50); document.execCommand('insertText', false, prompt);
     await sleep(300);
+    const textAfterEC = el.textContent.replace(/﻿/g, '').trim();
+    L('[DBG-5] after execCommand len:', textAfterEC.length);
+  } else {
+    L('[DBG-4] beforeinput OK');
   }
 
-  // Click Generate
+  // --- Method 3: clipboard paste ---
+  L('[DBG-6] trying clipboard paste...');
+  el.focus();
+  const dt = new DataTransfer();
+  dt.setData('text/plain', prompt);
+  const pasteResult = el.dispatchEvent(new ClipboardEvent('paste', {
+    clipboardData: dt, bubbles: true, cancelable: true, composed: true,
+  }));
+  L('[DBG-7] paste notCanceled:', pasteResult);
+  await sleep(500);
+  const textAfterPaste = el.textContent.replace(/﻿/g, '').trim();
+  L('[DBG-8] after paste len:', textAfterPaste.length);
+
+  // Helper: call React onClick via fiber (bypasses isTrusted guard)
+  function reactClick(el) {
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+    if (!fiberKey) return false;
+    let node = el[fiberKey];
+    while (node) {
+      if (node.memoizedProps?.onClick) {
+        const nativeEvt = { isTrusted: true, type: 'click', target: el, currentTarget: el };
+        node.memoizedProps.onClick({ type: 'click', target: el, currentTarget: el, bubbles: true, isTrusted: true, nativeEvent: nativeEvt, preventDefault() {}, stopPropagation() {}, persist() {} });
+        return true;
+      }
+      node = node.return;
+    }
+    return false;
+  }
+
+  // --- Find & click Generate button ---
+  L('[DBG-9] scanning for Generate button...');
   for (let i = 0; i < 30; i++) {
     const btn = xpathOne(sel.GENERATE_BTN);
-    if (btn && !btn.disabled) { btn.click(); return { success: true }; }
+    if (!btn) { if (i === 0) L('[DBG-10] no arrow_forward button found'); await sleep(200); continue; }
+    L('[DBG-10] attempt', i, 'disabled=', btn.disabled, 'rect=', JSON.stringify(btn.getBoundingClientRect()));
+    if (!btn.disabled) {
+      L('[DBG-11] clicking btn:', btn.outerHTML.slice(0,120));
+      // Try React fiber onClick first (bypasses isTrusted), fall back to realClick
+      const fiberOk = reactClick(btn);
+      L('[DBG-11b] reactClick ok=', fiberOk);
+      if (!fiberOk) realClick(btn);
+      await sleep(800);
+      L('[DBG-12] after click: inDOM=', document.contains(btn), 'disabled=', btn.disabled);
+      return { success: true, logs };
+    }
     await sleep(200);
   }
-  return { success: false, error: 'Generate button stayed disabled.' };
+  return { success: false, error: 'Generate button stayed disabled.', logs };
+
+  } catch (e) {
+    L('[DBG-ERR] exception:', e.message);
+    return { success: false, error: `JS exception: ${e.message}`, logs };
+  }
 }
 
 // ─── Page function (world: MAIN) ─────────────────────────────────────────────
@@ -528,10 +592,10 @@ async function submitPromptInPage(prompt, sel, imgConfig) {
     await sleep(300);
   }
 
-  // ── C. Click Generate ────────────────────────────────────────────────────
+  // ── C. Click Generate — use realClick (full pointer sequence) for React compatibility
   for (let i = 0; i < 30; i++) {
     const btn = xpathOne(sel.GENERATE_BTN);
-    if (btn && !btn.disabled) { btn.click(); return { success: true }; }
+    if (btn && !btn.disabled) { realClick(btn); return { success: true }; }
     await sleep(200);
   }
   return { success: false, error: `Generate button stayed disabled.` };
@@ -937,7 +1001,9 @@ $('btn-start').addEventListener('click', async () => {
     const r = await chrome.scripting.executeScript({
       target: { tabId: tab.id }, func, args, world: 'MAIN',
     });
-    return r?.[0]?.result;
+    const entry = r?.[0];
+    if (entry?.error) throw new Error(entry.error.message || JSON.stringify(entry.error));
+    return entry?.result;
   }
 
   // Init known UUIDs (so we don't claim pre-existing images as new)
@@ -966,10 +1032,14 @@ $('btn-start').addEventListener('click', async () => {
 
   // Helper: submit a prompt to the page (reused by main loop + retry)
   async function submitOne(prompt, frameConfig) {
+    let result;
     if (modeTab === 'video') {
-      return await execInTab(submitVideoPromptInPage, [prompt, SEL, frameConfig.startRef, frameConfig.endRef]);
+      result = await execInTab(submitVideoPromptInPage, [prompt, SEL, frameConfig.startRef, frameConfig.endRef]);
+    } else {
+      result = await execInTab(submitPromptInPage, [prompt, SEL, frameConfig]);
     }
-    return await execInTab(submitPromptInPage, [prompt, SEL, frameConfig]);
+    if (result?.logs?.length) result.logs.forEach(l => log(l, 'info'));
+    return result;
   }
 
   // Helper: register pending entry + handle final outcome (success or failure)
