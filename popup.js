@@ -777,8 +777,8 @@ $('tab-image').addEventListener('click', () => setModeTab('image'));
 $('tab-video').addEventListener('click', () => setModeTab('video'));
 function setModeTab(m) {
   modeTab = m;
-  $('tab-image').className = 'ref-mode-btn' + (m === 'image' ? ' active' : '');
-  $('tab-video').className = 'ref-mode-btn' + (m === 'video' ? ' active' : '');
+  $('tab-image').className = 'tab-btn' + (m === 'image' ? ' active' : '');
+  $('tab-video').className = 'tab-btn' + (m === 'video' ? ' active' : '');
   $('ref-image-section').style.display = m === 'image' ? 'block' : 'none';
   $('ref-video-section').style.display = m === 'video' ? 'block' : 'none';
 }
