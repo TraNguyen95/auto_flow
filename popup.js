@@ -1071,7 +1071,7 @@ $('btn-start').addEventListener('click', async () => {
           } else log(`R${roundNum} #${idx + 1} ERR: ${r?.error || '?'}`, 'err');
         } catch (e) { log(`R${roundNum} #${idx + 1} FAILED: ${e.message}`, 'err'); }
         if (!ok) outcomes.set(idx, { idx, success: false, error: 'submit failed' });
-        if (running && i < indices.length - 1) await sleep(delay * 1000);
+        if (ok && running && i < indices.length - 1) await sleep(delay * 1000);
       }
     })();
 
@@ -1105,14 +1105,18 @@ $('btn-start').addEventListener('click', async () => {
             if (Date.now() - p.ts > genTimeoutMs) {
               p.done = true;
               outcomes.set(p.idx, { idx: p.idx, success: false, error: 'timeout' });
+              updateRow(p.idx, 'fail', roundNum, 'timeout');
               log(`R${roundNum} #${p.idx + 1} timeout`, 'warn');
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          log(`watch error: ${e.message}`, 'err');
+        }
         if (!running) {
           for (const p of inFlight.filter(p => !p.done)) {
             p.done = true;
             outcomes.set(p.idx, { idx: p.idx, success: false, error: 'stopped' });
+            updateRow(p.idx, 'fail', roundNum, 'stopped');
           }
           break;
         }
