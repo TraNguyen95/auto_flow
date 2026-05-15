@@ -311,7 +311,6 @@ async function submitVideoPromptInPage(prompt, sel, startRef, endRef) {
   const el = document.querySelector('[data-slate-editor="true"]')
     || document.querySelector('[contenteditable="true"][data-slate-node="value"]');
   if (!el) return { success: false, error: 'Slate editor not found.', logs };
-  L('[DBG-1] editor found, curText:', JSON.stringify(el.textContent.slice(0,50)));
 
   el.click(); await sleep(200);
   const range = document.createRange();
@@ -325,36 +324,25 @@ async function submitVideoPromptInPage(prompt, sel, startRef, endRef) {
     inputType: 'insertText', data: prompt,
     bubbles: true, cancelable: true, composed: true,
   });
-  const notCanceled = el.dispatchEvent(evt);
-  L('[DBG-2] beforeinput notCanceled:', notCanceled);
+  el.dispatchEvent(evt);
   await sleep(400);
   const textAfterBI = el.textContent.replace(/﻿/g, '').trim();
-  L('[DBG-3] after beforeinput len:', textAfterBI.length, '| text:', textAfterBI.slice(0,60));
 
   // --- Method 2: execCommand fallback ---
   if (!textAfterBI) {
-    L('[DBG-4] beforeinput no effect → execCommand');
     el.focus(); document.execCommand('selectAll');
     await sleep(50); document.execCommand('insertText', false, prompt);
     await sleep(300);
-    const textAfterEC = el.textContent.replace(/﻿/g, '').trim();
-    L('[DBG-5] after execCommand len:', textAfterEC.length);
-  } else {
-    L('[DBG-4] beforeinput OK');
   }
 
   // --- Method 3: clipboard paste ---
-  L('[DBG-6] trying clipboard paste...');
   el.focus();
   const dt = new DataTransfer();
   dt.setData('text/plain', prompt);
-  const pasteResult = el.dispatchEvent(new ClipboardEvent('paste', {
+  el.dispatchEvent(new ClipboardEvent('paste', {
     clipboardData: dt, bubbles: true, cancelable: true, composed: true,
   }));
-  L('[DBG-7] paste notCanceled:', pasteResult);
   await sleep(500);
-  const textAfterPaste = el.textContent.replace(/﻿/g, '').trim();
-  L('[DBG-8] after paste len:', textAfterPaste.length);
 
   // Helper: call React onClick via fiber (bypasses isTrusted guard)
   function reactClick(el) {
@@ -373,19 +361,14 @@ async function submitVideoPromptInPage(prompt, sel, startRef, endRef) {
   }
 
   // --- Find & click Generate button ---
-  L('[DBG-9] scanning for Generate button...');
   for (let i = 0; i < 30; i++) {
     const btn = xpathOne(sel.GENERATE_BTN);
-    if (!btn) { if (i === 0) L('[DBG-10] no arrow_forward button found'); await sleep(200); continue; }
-    L('[DBG-10] attempt', i, 'disabled=', btn.disabled, 'rect=', JSON.stringify(btn.getBoundingClientRect()));
+    if (!btn) { await sleep(200); continue; }
     if (!btn.disabled) {
-      L('[DBG-11] clicking btn:', btn.outerHTML.slice(0,120));
       // Try React fiber onClick first (bypasses isTrusted), fall back to realClick
       const fiberOk = reactClick(btn);
-      L('[DBG-11b] reactClick ok=', fiberOk);
       if (!fiberOk) realClick(btn);
       await sleep(800);
-      L('[DBG-12] after click: inDOM=', document.contains(btn), 'disabled=', btn.disabled);
       return { success: true, logs };
     }
     await sleep(200);
@@ -393,7 +376,7 @@ async function submitVideoPromptInPage(prompt, sel, startRef, endRef) {
   return { success: false, error: 'Generate button stayed disabled.', logs };
 
   } catch (e) {
-    L('[DBG-ERR] exception:', e.message);
+    L('ERR exception:', e.message);
     return { success: false, error: `JS exception: ${e.message}`, logs };
   }
 }
@@ -872,6 +855,30 @@ function showBanner(results, totalElapsed) {
     + `<button class="dismiss" onclick="this.parentElement.style.display='none'">✕</button>`;
   banner.style.display = 'flex';
 }
+const SR_ICON  = { wait:'○', sub:'⬆', gen:'⏳', done:'✓', fail:'✗', retry:'↺' };
+const SR_LABEL = { wait:'waiting', sub:'submitting', gen:'generating', done:'done', fail:'failed', retry:'→ next round' };
+function initStatusGrid(prompts) {
+  const g = $('status-grid'); g.innerHTML = '';
+  prompts.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'sr wait'; row.id = `sr-${i}`;
+    row.innerHTML = `<span class="sr-num">#${i+1}</span>`
+      + `<span class="sr-icon">○</span>`
+      + `<span class="sr-lbl">${escHtml(p.slice(0, 50))}</span>`
+      + `<span class="sr-det"></span>`;
+    g.appendChild(row);
+  });
+}
+function updateRow(idx, state, roundNum, det) {
+  const row = $(`sr-${idx}`);
+  if (!row) return;
+  row.className = `sr ${state}`;
+  row.querySelector('.sr-icon').textContent = SR_ICON[state] || '?';
+  row.querySelector('.sr-lbl').textContent  = SR_LABEL[state] || state;
+  row.querySelector('.sr-det').textContent  = roundNum
+    ? `R${roundNum}${det ? ' · ' + det : ''}` : (det || '');
+  row.scrollIntoView({ block: 'nearest' });
+}
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─── Video frames resolver (Option D hybrid) ──────────────────────────────────
@@ -911,8 +918,8 @@ $('btn-start').addEventListener('click', async () => {
 
   const delay      = Math.max(5, parseInt($('delay').value)       || 30);
   let   threads    = Math.max(1, parseInt($('threads').value)     ||  1);
-  const rawRetries = parseInt($('max-retries').value);
-  const maxRetries = Math.max(0, Number.isFinite(rawRetries) ? rawRetries : 3);
+  const rawRounds  = parseInt($('max-retries').value);
+  const maxRounds  = Math.max(1, Number.isFinite(rawRounds) ? rawRounds : 3);
   const genTimeoutMs = modeTab === 'video' ? 300000 : 180000; // 5min video, 3min image
 
   // Force threads=1 when auto-download enabled to guarantee correct prompt↔video mapping
@@ -987,14 +994,14 @@ $('btn-start').addEventListener('click', async () => {
   }
 
   running = true;
-  const results = [];
   const jobStartTime = Date.now();
   $('btn-start').disabled = true; $('btn-stop').disabled = false; $('prompts').disabled = true;
   $('log').innerHTML = ''; setProgress(0, prompts.length);
   $('summary-panel').style.display = 'none'; $('summary-panel').innerHTML = '';
   $('job-banner').style.display = 'none';
+  $('round-hdr').textContent = '';
   $('status-text').textContent = 'Running...';
-  log(`${prompts.length} prompts — pipeline cap=${threads} — ${delay}s gap — retry=${maxRetries} — timeout=${genTimeoutMs/1000}s`, 'info');
+  log(`${prompts.length} prompts — cap=${threads} — ${delay}s gap — rounds=${maxRounds} — timeout=${genTimeoutMs/1000}s`, 'info');
 
   // Helper to call page functions on the tab
   async function execInTab(func, args = []) {
@@ -1011,10 +1018,8 @@ $('btn-start').addEventListener('click', async () => {
   const knownUuids = new Set(initial.map(x => x.uuid));
   log(`Initial gallery: ${knownUuids.size} existing image(s).`, 'info');
 
-  // FIFO queue of pending submissions awaiting completion
-  // Each entry: { idx, resolve, ts, retries, prompt, frameConfig }
-  const pending = [];
-  let doneCount = 0;
+  // Status grid
+  initStatusGrid(prompts);
 
   // Helper: build frame config for a prompt index (reused by submit + retry)
   function buildFrameConfig(promptIdx) {
@@ -1042,138 +1047,120 @@ $('btn-start').addEventListener('click', async () => {
     return result;
   }
 
-  // Helper: register pending entry + handle final outcome (success or failure)
-  // Retry logic is handled by the watcher (entry stays in pending, no remove+re-add).
-  function registerPending(promptIdx, prompt, frameConfig) {
-    const tsub = Date.now();
-    const completion = new Promise(resolve => {
-      pending.push({ idx: promptIdx, resolve, ts: tsub, retries: 0, prompt, frameConfig });
-    });
-    completion.then(async (outcome) => {
-      const media = outcome?.media;
-      const retries = outcome?.retries ?? 0;
-      if (!media) {
-        // Final failure — retries exhausted or stopped
-        results.push({ idx: promptIdx, prompt, status: 'failed', retries, error: 'timeout' });
-        doneCount++;
-        setProgress(doneCount, prompts.length);
-        $('status-text').textContent = `${doneCount} / ${prompts.length}`;
-        return;
-      }
-      // Success — download
-      const elapsed = ((Date.now() - tsub) / 1000).toFixed(1);
-      results.push({ idx: promptIdx, prompt, status: 'success', retries, genTime: elapsed });
-      log(`#${promptIdx + 1} ready (gen ${elapsed}s, ${retries > 0 ? retries + ' retries' : 'first try'}) -> uuid ${media.uuid.slice(0, 8)}...`, 'ok');
-      if (dlConfig) {
-        const fileNum = dlConfig.from + promptIdx;
-        const filename = `${dlConfig.folder}/${fileNum}.${dlConfig.ext}`;
+  // runRound: submit indices[], watch for media/timeout, return outcomes[]
+  async function runRound(indices, roundNum) {
+    $('round-hdr').textContent = `Round ${roundNum} / ${maxRounds}  ·  ${threads} cap  ·  ${delay}s gap`;
+    const outcomes = new Map();
+    const inFlight = []; // { idx, ts, done }
+
+    const submitLoop = (async () => {
+      for (let i = 0; i < indices.length; i++) {
+        const idx = indices[i];
+        if (!running) break;
+        while (inFlight.filter(p => !p.done).length >= threads && running) await sleep(500);
+        if (!running) break;
+        updateRow(idx, 'sub', roundNum);
+        let ok = false;
         try {
-          await chrome.downloads.download({
-            url: media.url, filename, saveAs: false, conflictAction: 'uniquify',
-          });
-          log(`#${promptIdx + 1} downloaded -> ${filename}`, 'ok');
-        } catch (err) { log(`#${promptIdx + 1} download FAILED: ${err.message}`, 'err'); }
+          const r = await submitOne(prompts[idx], buildFrameConfig(idx));
+          if (r?.success) {
+            inFlight.push({ idx, ts: Date.now(), done: false });
+            updateRow(idx, 'gen', roundNum);
+            log(`R${roundNum} #${idx + 1} submitted`, 'ok');
+            ok = true;
+          } else log(`R${roundNum} #${idx + 1} ERR: ${r?.error || '?'}`, 'err');
+        } catch (e) { log(`R${roundNum} #${idx + 1} FAILED: ${e.message}`, 'err'); }
+        if (!ok) outcomes.set(idx, { idx, success: false, error: 'submit failed' });
+        if (running && i < indices.length - 1) await sleep(delay * 1000);
       }
-      doneCount++;
-      setProgress(doneCount, prompts.length);
-      $('status-text').textContent = `${doneCount} / ${prompts.length}`;
-    });
-  }
+    })();
 
-  // Background watcher: poll DOM for new media + handle timeouts/retries
-  const watcher = (async () => {
-    while (running && doneCount < prompts.length) {
-      try {
-        // Check for new media UUIDs
-        const items = (await execInTab(snapshotMediaInPage, [modeTab])) || [];
-        for (const it of items) {
-          if (knownUuids.has(it.uuid)) continue;
-          knownUuids.add(it.uuid);
-          if (pending.length > 0) {
-            const w = pending.shift();
-            w.resolve({ media: it, retries: w.retries });
-          }
-        }
-        // Check timeouts — retry in-place or resolve as failure
-        for (let j = pending.length - 1; j >= 0; j--) {
-          const p = pending[j];
-          if (Date.now() - p.ts <= genTimeoutMs) continue;
-          if (p.retries < maxRetries && running) {
-            // Retry: re-submit, entry stays in pending (no slot release)
-            log(`#${p.idx + 1} timed out after ${genTimeoutMs / 1000}s, retrying (${p.retries + 1}/${maxRetries})...`, 'warn');
-            try {
-              const r = await submitOne(p.prompt, p.frameConfig);
-              if (r?.success) {
-                p.retries++;
-                p.ts = Date.now(); // reset timeout clock
-                log(`#${p.idx + 1} re-submitted (retry ${p.retries}/${maxRetries})`, 'info');
-                continue; // keep in pending
+    const watchLoop = (async () => {
+      while (true) {
+        try {
+          const items = (await execInTab(snapshotMediaInPage, [modeTab])) || [];
+          for (const it of items) {
+            if (knownUuids.has(it.uuid)) continue;
+            knownUuids.add(it.uuid);
+            const p = inFlight.find(p => !p.done);
+            if (p) {
+              p.done = true;
+              const genTime = Math.round((Date.now() - p.ts) / 1000);
+              outcomes.set(p.idx, { idx: p.idx, success: true, media: it, genTime });
+              updateRow(p.idx, 'done', roundNum, `${genTime}s`);
+              log(`R${roundNum} #${p.idx + 1} done ${genTime}s`, 'ok');
+              if (dlConfig) {
+                const fileNum = dlConfig.from + p.idx;
+                const fn = `${dlConfig.folder}/${fileNum}.${dlConfig.ext}`;
+                try {
+                  await chrome.downloads.download({ url: it.url, filename: fn, saveAs: false, conflictAction: 'uniquify' });
+                  log(`#${p.idx + 1} → ${fn}`, 'ok');
+                } catch (e) { log(`#${p.idx + 1} dl err: ${e.message}`, 'err'); }
               }
-              log(`#${p.idx + 1} retry submit failed: ${r?.error || '?'}`, 'err');
-            } catch (err) {
-              log(`#${p.idx + 1} retry submit error: ${err.message}`, 'err');
+              cumulativeSuccess++;
+              setProgress(cumulativeSuccess, prompts.length);
             }
-          } else if (p.retries >= maxRetries) {
-            log(`#${p.idx + 1} failed after ${maxRetries} retries, skipping`, 'err');
           }
-          // Final failure: remove and resolve
-          pending.splice(j, 1)[0].resolve({ media: null, retries: p.retries });
+          for (const p of inFlight.filter(p => !p.done)) {
+            if (Date.now() - p.ts > genTimeoutMs) {
+              p.done = true;
+              outcomes.set(p.idx, { idx: p.idx, success: false, error: 'timeout' });
+              log(`R${roundNum} #${p.idx + 1} timeout`, 'warn');
+            }
+          }
+        } catch (_) {}
+        if (!running) {
+          for (const p of inFlight.filter(p => !p.done)) {
+            p.done = true;
+            outcomes.set(p.idx, { idx: p.idx, success: false, error: 'stopped' });
+          }
+          break;
         }
-      } catch (_) {}
-      await sleep(1500);
-    }
-    // Drain remaining pending on stop
-    for (const p of pending.splice(0)) p.resolve({ media: null, retries: p.retries });
-  })();
+        if (outcomes.size === indices.length) break;
+        await sleep(1500);
+      }
+    })();
 
-  // Submit phase — serial submits, cap in-flight = threads
-  for (let i = 0; i < prompts.length; i++) {
-    if (!running) break;
-
-    // Wait for slot
-    if (pending.length >= threads) {
-      log(`#${i + 1} waiting for slot (in-flight: ${pending.length}/${threads})...`);
-      while (pending.length >= threads && running) await sleep(2000);
-    }
-    if (!running) break;
-
-    log(`#${i + 1} submitting (in-flight before: ${pending.length})...`);
-    const frameConfig = buildFrameConfig(i);
-    let submitOk = false;
-    try {
-      const r = await submitOne(prompts[i], frameConfig);
-      if (r?.success) { submitOk = true; log(`#${i + 1} submitted`, 'ok'); }
-      else log(`#${i + 1} submit ERR: ${r?.error || '?'}`, 'err');
-    } catch (err) {
-      log(`#${i + 1} submit FAILED: ${err.message}`, 'err');
-    }
-
-    if (!submitOk) {
-      results.push({ idx: i, prompt: prompts[i], status: 'skipped', retries: 0, error: 'submit failed' });
-      doneCount++; setProgress(doneCount, prompts.length); continue;
-    }
-
-    registerPending(i, prompts[i], frameConfig);
-
-    // Inter-submit delay (gives Slate time to reset; also paces submissions)
-    if (i < prompts.length - 1) await sleep(delay * 1000);
+    await submitLoop;
+    await watchLoop;
+    return indices.map(idx => outcomes.get(idx) || { idx, success: false, error: 'not resolved' });
   }
 
-  log(`All prompts submitted. Waiting for ${pending.length} remaining generation(s)...`, 'info');
-  await watcher;
+  // Rounds loop
+  const allResults = new Array(prompts.length).fill(null);
+  let toRun = prompts.map((_, i) => i);
+  let cumulativeSuccess = 0; // tracks total successes across all rounds for setProgress
 
-  // Record any prompts that were never submitted (user clicked Stop mid-loop)
-  const recorded = new Set(results.map(r => r.idx));
+  for (let round = 1; round <= maxRounds && toRun.length > 0 && running; round++) {
+    log(`Round ${round}/${maxRounds}: ${toRun.length} prompt(s)`, 'info');
+    const roundOutcomes = await runRound(toRun, round);
+    const nextRun = [];
+    for (const o of roundOutcomes) {
+      allResults[o.idx] = { idx: o.idx, prompt: prompts[o.idx], status: o.success ? 'success' : 'failed', retries: round - 1, genTime: o.genTime, error: o.error };
+      if (!o.success && round < maxRounds && running && o.error !== 'stopped') {
+        nextRun.push(o.idx);
+        updateRow(o.idx, 'retry', round);
+      } else if (!o.success) {
+        updateRow(o.idx, 'fail', round);
+      }
+    }
+    log(`Round ${round} done. ${nextRun.length > 0 ? nextRun.length + ' queued for R' + (round + 1) : 'all resolved.'}`, 'info');
+    toRun = nextRun;
+  }
+
+  // Any prompts never entered a round (stopped early)
   for (let k = 0; k < prompts.length; k++) {
-    if (!recorded.has(k)) {
-      results.push({ idx: k, prompt: prompts[k], status: 'skipped', retries: 0, error: 'stopped' });
+    if (!allResults[k]) {
+      allResults[k] = { idx: k, prompt: prompts[k], status: 'skipped', retries: 0, error: 'stopped' };
+      updateRow(k, 'fail');
     }
   }
+  const results = allResults;
 
   const totalElapsed = Math.round((Date.now() - jobStartTime) / 1000);
   renderSummary(results, totalElapsed);
   showBanner(results, totalElapsed);
-  if (running) { $('status-text').textContent = 'All done!'; log(`Finished ${doneCount} prompts.`, 'ok'); }
+  if (running) { $('status-text').textContent = 'All done!'; log('All rounds complete.', 'ok'); }
   else         { log('Stopped.', 'warn'); }
   running = false;
   $('btn-start').disabled = false; $('btn-stop').disabled = true; $('prompts').disabled = false;
