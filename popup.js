@@ -575,10 +575,29 @@ async function submitPromptInPage(prompt, sel, imgConfig) {
     await sleep(300);
   }
 
-  // ── C. Click Generate — use realClick (full pointer sequence) for React compatibility
+  // ── C. Click Generate — reactClick via fiber first (bypasses isTrusted), fallback realClick
+  function reactClick(el) {
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+    if (!fiberKey) return false;
+    let node = el[fiberKey];
+    while (node) {
+      if (node.memoizedProps?.onClick) {
+        const nativeEvt = { isTrusted: true, type: 'click', target: el, currentTarget: el };
+        node.memoizedProps.onClick({ type: 'click', target: el, currentTarget: el, bubbles: true, isTrusted: true, nativeEvent: nativeEvt, preventDefault() {}, stopPropagation() {}, persist() {} });
+        return true;
+      }
+      node = node.return;
+    }
+    return false;
+  }
+
   for (let i = 0; i < 30; i++) {
     const btn = xpathOne(sel.GENERATE_BTN);
-    if (btn && !btn.disabled) { realClick(btn); return { success: true }; }
+    if (btn && !btn.disabled) {
+      const fiberOk = reactClick(btn);
+      if (!fiberOk) realClick(btn);
+      return { success: true };
+    }
     await sleep(200);
   }
   return { success: false, error: `Generate button stayed disabled.` };
